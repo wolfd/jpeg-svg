@@ -1,21 +1,12 @@
 import typing
 import struct
 from collections import namedtuple
-"""
-typedef struct _JFIFHeader
-{
-  BYTE SOI[2];          /* 00h  Start of Image Marker     */
-  BYTE APP0[2];         /* 02h  Application Use Marker    */
-  BYTE Length[2];       /* 04h  Length of APP0 Field      */
-  BYTE Identifier[5];   /* 06h  "JFIF" (zero terminated) Id String */
-  BYTE Version[2];      /* 07h  JFIF Format Revision      */
-  BYTE Units;           /* 09h  Units used for Resolution */
-  BYTE Xdensity[2];     /* 0Ah  Horizontal Resolution     */
-  BYTE Ydensity[2];     /* 0Ch  Vertical Resolution       */
-  BYTE XThumbnail;      /* 0Eh  Horizontal Pixel Count    */
-  BYTE YThumbnail;      /* 0Fh  Vertical Pixel Count      */
-} JFIFHEAD;
-"""
+import numpy as np
+
+from zigzag import fill_zigzag
+
+BLOCK_SIDE_PX = 8
+BLOCK_SIZE_BYTE = BLOCK_SIDE_PX * BLOCK_SIDE_PX
 
 SOI_EXPECTED = (0xFF, 0xD8)
 JFIF_APP0_EXPECTED = (0xFF, 0xE0)
@@ -29,7 +20,25 @@ def unpack_from_file(format, file_):
 def one_from_file(format, file_):
     return unpack_from_file(format, file_)[0]
 
+def get_zero_block(dtype=np.uint8):
+    return np.zeros(shape=(BLOCK_SIDE_PX, BLOCK_SIDE_PX), dtype=dtype)
+
 def read_jfif_header(file_):
+    """
+    typedef struct _JFIFHeader
+    {
+    BYTE SOI[2];          /* 00h  Start of Image Marker     */
+    BYTE APP0[2];         /* 02h  Application Use Marker    */
+    BYTE Length[2];       /* 04h  Length of APP0 Field      */
+    BYTE Identifier[5];   /* 06h  "JFIF" (zero terminated) Id String */
+    BYTE Version[2];      /* 07h  JFIF Format Revision      */
+    BYTE Units;           /* 09h  Units used for Resolution */
+    BYTE Xdensity[2];     /* 0Ah  Horizontal Resolution     */
+    BYTE Ydensity[2];     /* 0Ch  Vertical Resolution       */
+    BYTE XThumbnail;      /* 0Eh  Horizontal Pixel Count    */
+    BYTE YThumbnail;      /* 0Fh  Vertical Pixel Count      */
+    } JFIFHEAD;
+    """
     # SOI is the start of image marker and always contains the marker code
     # values FFh D8h.
     assert unpack_from_file("2B", file_) == SOI_EXPECTED
@@ -126,17 +135,30 @@ def read_dqt_header(jpeg, file_):
     length = one_from_file(">H", file_)
 
     qt_information = one_from_file("B", file_)
-    # 0 1 2 3 4 5 6 7
-    # bit 0..3: number of QT (0..3, otherwise error)
-    # bit 4..7: precision of QT, 0 = 8 bit, otherwise 16 bit
-    num_qt = ((1 << 4) - 1) & (qt_information >> 4)
-    precision = ((1 << 4) - 1) & qt_information
+    # bit 0..3: precision of QT, 0 = 8 bit, otherwise 16 bit
+    # bit 4..7: QT id (0..3, otherwise error)
+    qt_num = ((1 << 4) - 1) & qt_information
+    precision = ((1 << 4) - 1) & (qt_information >> 4)
 
-    print("num of qt: {}".format(num_qt))
+    # read rest of the bytes
+    bytes_left = length - 3
+
+    assert bytes_left / (precision + 1) == 64
+    print("bytes left: {}".format(bytes_left))
+
+    print("precision: {} qt_num: {}".format(precision, qt_num))
 
     # This gives QT values, n = 64*(precision+1)
-    bytes_ = unpack_from_file("{}B".format(64 * (precision + 1)), file_)
-    print(bytes_)
+    if precision == 0:
+        qt_table = unpack_from_file("{}B".format(64), file_)
+        block = get_zero_block()
+    else:  # precision > 0
+        qt_table = unpack_from_file(">{}H".format(64), file_)
+        block = get_zero_block(dtype=np.uint16)
+    print(qt_table)
+
+    fill_zigzag(qt_table, block)
+    print(block)
 
 
 # https://en.wikipedia.org/wiki/JPEG#Syntax_and_structure
@@ -192,7 +214,7 @@ def get_next_marker(file_):
         marker_identifier = find_next_ff()
         if marker_identifier is None:
             return None  # EOF
-        if marker_identifier != b"\x00":
+        elif marker_identifier != b"\x00":
             break  # not a byte stuffed thing!
 
     int_marker_id = struct.unpack("B", marker_identifier)[0]
@@ -221,4 +243,4 @@ with open("example.jpg", "rb") as jpeg_file:
         marker_position = get_next_marker(jpeg_file)
         if marker_position is None:
             break
-        print("{}".format(marker_position))
+        print("{}".format(hex(marker_position)))
