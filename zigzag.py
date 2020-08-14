@@ -1,7 +1,8 @@
+import typing
 import numpy as np
 
-# inspired by: https://github.com/nmayorov/jpeg-decoder/blob/master/src/util.h
-def fill_zigzag(flat_table, block):
+# inspired by: https://github.com/nmayorov/jpeg-decoder/blob/master/src/util.h (appears to be gone)
+def fill_zigzag(flat_table: typing.Iterable[int], block: np.array):
     rows, cols = block.shape
     i, j = 0, 0
     di, dj = -1, 1
