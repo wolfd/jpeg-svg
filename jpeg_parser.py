@@ -1,6 +1,6 @@
 import typing as T
 import struct
-from collections import namedtuple
+import enum
 import numpy as np
 
 from zigzag import fill_zigzag
@@ -25,7 +25,25 @@ def get_zero_block(dtype=np.uint8):
     return np.zeros(shape=(BLOCK_SIDE_PX, BLOCK_SIDE_PX), dtype=dtype)
 
 
-def read_jfif_header(file_: T.BinaryIO):
+class Jpeg(object):
+    def __init__(self, file_: T.BinaryIO):
+        self.jfif_header: T.Optional[JfifHeader] = None
+        self.huffman_tables: T.List[Huffman] = []
+        self.start_of_frame: T.Optional[StartOfFrame] = None
+
+
+class DensityUnits(enum.Enum):
+    NONE = 0
+    DOTS_PER_INCH = 1
+    DOTS_PER_CM = 2
+
+
+JfifHeader = T.NamedTuple(
+    "JfifHeader", [("version", int), ("density_units", DensityUnits)]
+)
+
+
+def read_jfif_header(jpeg: Jpeg, file_: T.BinaryIO):
     """
     typedef struct _JFIFHeader
     {
@@ -59,7 +77,7 @@ def read_jfif_header(file_: T.BinaryIO):
     # Identifier contains the values 4Ah 46h 49h 46h 00h (JFIF) and is used to
     # identify the code stream as conforming to the JFIF specification.
     assert one_from_file("5s", file_) == b"JFIF\x00"
-    print("JFIF version: {}".format(unpack_from_file("2B", file_)))
+    version = unpack_from_file("2B", file_)
 
     # Units, Xdensity, and Ydensity identify the unit of measurement used to
     # describe the image resolution.
@@ -68,7 +86,6 @@ def read_jfif_header(file_: T.BinaryIO):
     #  - 02h for dots per centimeter
     #  - 00h for none (use measurement as pixel aspect ratio).
     units = one_from_file("B", file_)
-    print("Units: {}".format(units))
 
     # Xdensity and Ydensity are the horizontal and vertical resolution of the
     # image data, respectively. If the Units field value is 00h, the Xdensity
@@ -84,17 +101,28 @@ def read_jfif_header(file_: T.BinaryIO):
     y_thumbnail = one_from_file("B", file_)
     print("x_thumbnail: {}, y_thumbnail: {}".format(x_thumbnail, y_thumbnail))
 
+    thumbnail_data: T.Optional[T.Iterable[int]] = None
     if x_thumbnail * y_thumbnail > 0:
         # (RGB) * k (3 * k bytes) Packed (byte-interleaved) 24-bit RGB values
         # (8 bits per colour channel) for the thumbnail pixels, in the order
         # R0, G0, B0, ... Rk,
         # Gk, Bk, with k = HthumbnailA * VthumbnailA.
+        print("Reading {} bytes of thumbnail data".format(len(thumbnail_data)))
         thumbnail_data = file_.read(3 * x_thumbnail * y_thumbnail)
-        print("discarding {} bytes of thumbnail data".format(len(thumbnail_data)))
+
+    jpeg.jfif_header = JfifHeader(
+        version=version,
+        density_units=DensityUnits(units),
+        x_density=x_density,
+        y_density=y_density,
+        x_thumbnail=x_thumbnail,
+        y_thumbnail=y_thumbnail,
+        thumbnail_data=thumbnail_data,
+    )
 
 
 # http://vip.sugovica.hu/Sardi/kepnezo/JPEG%20File%20Layout%20and%20Format.htm
-def read_dht_header(jpeg, file_: T.BinaryIO):
+def read_dht_header(jpeg: Jpeg, file_: T.BinaryIO):
     """
     Read Huffman Table
     """
@@ -138,7 +166,7 @@ def read_dht_header(jpeg, file_: T.BinaryIO):
 
     print(symbols)
 
-    print(Huffman(num_symbols_per_bit_length, symbols).root)
+    huff = Huffman(num_symbols_per_bit_length, symbols)
 
     if (file_.tell() - start_seek_position) != length:
         raise NotImplementedError(
@@ -151,7 +179,7 @@ def read_dht_header(jpeg, file_: T.BinaryIO):
     # TODO: that
 
 
-def read_dqt_header(jpeg, file_):
+def read_dqt_header(jpeg: Jpeg, file_: T.BinaryIO):
     start_seek_position = file_.tell()
 
     length = one_from_file(">H", file_)
@@ -183,12 +211,92 @@ def read_dqt_header(jpeg, file_):
     print(block)
 
 
+class ComponentType(enum.Enum):
+    Y = 1
+    Cb = 2
+    Cr = 3
+    I = 4
+    Q = 5
+
+
+SamplingFactors = T.NamedTuple(
+    "SamplingFactors", [("vertical", int), ("horizontal", int)]
+)
+
+
+def parse_sampling_factors(value: int) -> SamplingFactors:
+    return SamplingFactors(
+        # anding redundant if byte
+        vertical=value >> 4 & 0xF,
+        horizontal=value & 0xF,
+    )
+
+
+ComponentInfo = T.NamedTuple(
+    "ComponentInfo",
+    [
+        ("component_id", ComponentType),
+        ("sampling_factors", SamplingFactors),
+        ("quantization_table_id", int),
+    ],
+)
+
+
+StartOfFrame = T.NamedTuple(
+    "StartOfFrame",
+    [
+        ("data_precision", int),
+        ("image_height", int),
+        ("image_width", int),
+        ("components", T.List[ComponentInfo]),
+    ],
+)
+
+
+def read_sof0_header(jpeg: Jpeg, file_: T.BinaryIO):
+    start_seek_position = file_.tell()
+
+    length = one_from_file(">H", file_)
+    data_precision = one_from_file("B", file_)  # bit depth of image (8)
+    assert data_precision == 8
+
+    image_height = one_from_file(">H", file_)
+    image_width = one_from_file(">H", file_)
+
+    num_components = one_from_file("B", file_)  # 1 = gray, 3 = color
+    components = []
+    for _ in range(num_components):
+        components.append(
+            ComponentInfo(
+                component_id=ComponentType(one_from_file("B", file_)),
+                sampling_factors=parse_sampling_factors(one_from_file("B", file_)),
+                quantization_table_id=one_from_file("B", file_),
+            )
+        )
+
+    jpeg.start_of_frame = StartOfFrame(
+        data_precision=data_precision,
+        image_height=image_height,
+        image_width=image_width,
+        components=components,
+    )
+
+
 # https://en.wikipedia.org/wiki/JPEG#Syntax_and_structure
-Marker = namedtuple("Marker", ["short", "name", "decoder"])
+Marker = T.NamedTuple(
+    "Marker",
+    [
+        ("short", str),
+        ("name", str),
+        ("decoder", T.Callable[[T.Any, T.BinaryIO], T.Any]),
+    ],
+)
 
 MARKER_LOOKUP = {
     0xD8: Marker(short="SOI", name="Start Of Image", decoder=None),
-    0xC0: Marker(short="SOF0", name="Start Of Frame (baseline DCT)", decoder=None),
+    0xC0: Marker(
+        short="SOF0", name="Start Of Frame (baseline DCT)", decoder=read_sof0_header
+    ),
     0xC2: Marker(short="SOF2", name="Start Of Frame (progressive DCT)", decoder=None),
     0xC4: Marker(short="DHT", name="Define Huffman Table(s)", decoder=read_dht_header),
     0xDB: Marker(
@@ -229,7 +337,7 @@ def add_app14_marker():
     )
 
 
-def get_next_marker(file_: T.BinaryIO):
+def get_next_marker(jpeg: Jpeg, file_: T.BinaryIO):
     """ returns the next marker, with it's index """
     seek_position = file_.tell()
     # ignore byte-stuffed FFs (0xFF, 0x00)
@@ -259,7 +367,7 @@ def get_next_marker(file_: T.BinaryIO):
         )
 
         if found_marker.decoder is not None:
-            found_marker.decoder({}, file_)
+            found_marker.decoder(jpeg, file_)
     else:
         print("Unknown marker {}".format(hex(int_marker_id)))
 

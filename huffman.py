@@ -3,6 +3,13 @@ import typing as T
 Node = T.Union[int, T.List["Node"]]
 
 
+def bitstream(data: bytes):
+    for byte in data:
+        for bit_index in range(7, 0, -1):
+            bit = (byte >> bit_index) & 0b1
+            yield bit
+
+
 class Huffman(object):
     def __init__(
         self, symbols_per_bit_length: T.List[int], symbols: T.List[T.List[int]]
@@ -32,10 +39,22 @@ class Huffman(object):
             if self.bits_from_lengths(root[i], symbol, bit_length - 1):
                 return True
 
-    def __getitem__(self, key_list: T.List[int]):
+    def __getitem__(self, key_list: bytes):
         level = self.root
         for key in key_list:
             level = level[key]
 
         return level
 
+    def decode_bytes(self, data: bytes) -> T.Iterator[int]:
+        node = self.root
+        for bit in bitstream(data):
+            if not isinstance(node, list):
+                raise ValueError("Expected a node, not a leaf")
+            if bit < len(node):
+                node = node[bit]
+                if isinstance(node, int):
+                    yield node
+                    node = self.root  # reset for next symbol
+            else:
+                raise ValueError("Incomplete huff tree")
